@@ -200,10 +200,17 @@ class DeepseekV2Eagle3Model(nn.Module):
         )
 
         # fc layer for combining auxiliary hidden states (3x hidden size input)
-        if hasattr(self.config, "target_hidden_size"):
-            fc_input_size = self.config.target_hidden_size * 3
-        else:
-            fc_input_size = self.config.hidden_size * 3
+        # Determine number of auxiliary hidden states and target hidden size
+        num_aux_hidden_states = getattr(self.config, "num_aux_hidden_states", None)
+        if num_aux_hidden_states is None:
+            eagle_config = getattr(self.config, "eagle_config", None) or {}
+            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+            num_aux_hidden_states = len(layer_ids) if layer_ids else 3
+
+        target_hidden_size = getattr(
+            self.config, "target_hidden_size", self.config.hidden_size
+        )
+        fc_input_size = target_hidden_size * num_aux_hidden_states
 
         self.fc = ReplicatedLinear(
             input_size=fc_input_size,

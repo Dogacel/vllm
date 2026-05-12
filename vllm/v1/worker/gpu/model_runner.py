@@ -271,6 +271,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_loader = get_model_loader(self.vllm_config.load_config)
             logger.info("Loading model from scratch...")
 
+            # If speculative EAGLE3 aux layer list is provided in the draft model
+            # HF config, propagate it into the target model HF config so the
+            # model constructors allocate layers/buffers (e.g., FC, mask_hidden)
+            # using the correct `num_aux_hidden_states` at init time.
+            if (
+                self.use_aux_hidden_state_outputs
+                and self.speculative_config is not None
+                and getattr(self.speculative_config, "draft_model_config", None)
+                is not None
+            ):
+                draft_hf = self.speculative_config.draft_model_config.hf_config
+                aux_layers = getattr(draft_hf, "eagle_aux_hidden_state_layer_ids", None)
+                if aux_layers is not None:
+                    target_hf = self.vllm_config.model_config.hf_config
+                    eagle_cfg = getattr(target_hf, "eagle_config", None) or {}
+                    eagle_cfg["eagle_aux_hidden_state_layer_ids"] = tuple(aux_layers)
+                    target_hf.eagle_config = eagle_cfg
+
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
             )
@@ -279,14 +297,112 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model, self.vllm_config, self.device
                 )
 
+            aux_layers = None
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                # Prefer explicit aux layer list from speculative config.
+                hf_config = self.speculative_config.draft_model_config.hf_config
+                aux_layers = getattr(
+                    hf_config, "eagle_aux_hidden_state_layer_ids", None
+                )
             if self.speculator is not None:
+                # Load drafter model (may depend on target model for shared emb/lm_head)
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+                # If no explicit aux layers provided, ask the drafter model for defaults
+                if self.use_aux_hidden_state_outputs and aux_layers is None:
+                    try:
+                        aux_layers = self.speculator.model.get_eagle3_default_aux_hidden_state_layers()
+                    except Exception:
+                        aux_layers = None
+
+            # Finally, if aux hidden states requested, set the same aux layers
+            # on both target and drafter models so capture and consumption match.
+            if self.use_aux_hidden_state_outputs:
+                # If aux_layers is still None, let the helper determine defaults.
+                if aux_layers is not None:
+                    # Set explicit layers on target model
+                    if hasattr(self.model, "set_aux_hidden_state_layers"):
+                        self.model.set_aux_hidden_state_layers(tuple(aux_layers))
+                        # Ensure model knows the number of aux hidden states
+                        try:
+                            # Some model wrappers store the language model on `.model`
+                            parent_ref = self.model
+                            if hasattr(self.model, "get_language_model"):
+                                parent_ref = self.model.get_language_model()
+                            elif hasattr(self.model, "language_model"):
+                                parent_ref = self.model.language_model
+                            # Update numeric attribute if present
+                            if hasattr(parent_ref, "num_aux_hidden_states"):
+                                parent_ref.num_aux_hidden_states = len(aux_layers)
+                            if hasattr(parent_ref, "model") and hasattr(
+                                parent_ref.model, "num_aux_hidden_states"
+                            ):
+                                parent_ref.model.num_aux_hidden_states = len(aux_layers)
+                            # Resize mask_hidden buffer if exists (parallel drafting)
+                            if (
+                                hasattr(parent_ref, "mask_hidden")
+                                and parent_ref.mask_hidden is not None
+                            ):
+                                target_hidden_size = getattr(
+                                    parent_ref.config, "target_hidden_size", None
+                                )
+                                if target_hidden_size is None:
+                                    # Fallback to hidden_size on config
+                                    target_hidden_size = getattr(
+                                        parent_ref.config, "hidden_size", None
+                                    )
+                                if target_hidden_size is not None:
+                                    new_size = len(aux_layers) * int(target_hidden_size)
+                                    with torch.no_grad():
+                                        if parent_ref.mask_hidden.numel() != new_size:
+                                            parent_ref.register_buffer(
+                                                "mask_hidden",
+                                                parent_ref.mask_hidden.new_zeros(
+                                                    1, new_size
+                                                ),
+                                                persistent=False,
+                                            )
+                        except Exception:
+                            # Do not fail model loading for best-effort sync
+                            logger.debug(
+                                "Failed to update num_aux_hidden_states/mask_hidden",
+                                exc_info=True,
+                            )
+                    # Set explicit layers on drafter model if present
+                    if self.speculator is not None and hasattr(
+                        self.speculator, "model"
+                    ):
+                        drafter = self.speculator.model
+                        if hasattr(drafter, "set_aux_hidden_state_layers"):
+                            drafter.set_aux_hidden_state_layers(tuple(aux_layers))
+                            try:
+                                # Also update numeric attr on drafter if present
+                                parent_ref = drafter
+                                if hasattr(drafter, "get_language_model"):
+                                    parent_ref = drafter.get_language_model()
+                                elif hasattr(drafter, "language_model"):
+                                    parent_ref = drafter.language_model
+                                if hasattr(parent_ref, "num_aux_hidden_states"):
+                                    parent_ref.num_aux_hidden_states = len(aux_layers)
+                                if hasattr(parent_ref, "model") and hasattr(
+                                    parent_ref.model, "num_aux_hidden_states"
+                                ):
+                                    parent_ref.model.num_aux_hidden_states = len(
+                                        aux_layers
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "Failed to update drafter num_aux_hidden_states",
+                                    exc_info=True,
+                                )
+                else:
+                    # Fall back to original behaviour: set from speculative config
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

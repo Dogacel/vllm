@@ -185,6 +185,40 @@ def test_eagle3_lm_head_receives_quant_config():
         )
 
 
+def test_eagle3_mask_hidden_scales_with_aux_hidden_states():
+    from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+
+    mock_hf_config = Mock()
+    mock_hf_config.draft_vocab_size = 1000
+    mock_hf_config.hidden_size = 256
+    mock_hf_config.vocab_size = 32000
+    mock_hf_config.logit_scale = 1.0
+    mock_hf_config.num_aux_hidden_states = 5
+    mock_hf_config.target_hidden_size = 128
+
+    mock_vllm_config = Mock()
+    mock_vllm_config.speculative_config.draft_model_config.hf_config = mock_hf_config
+    mock_vllm_config.model_config.get_num_layers.return_value = 32
+    mock_vllm_config.model_config.dtype = torch.float16
+    mock_vllm_config.speculative_config.parallel_drafting = True
+
+    with (
+        patch("vllm.model_executor.models.llama_eagle3.LlamaModel") as MockModel,
+        patch("vllm.model_executor.models.llama_eagle3.ParallelLMHead"),
+        patch("vllm.model_executor.models.llama_eagle3.LogitsProcessor"),
+        patch(
+            "vllm.model_executor.models.llama_eagle3.get_draft_quant_config",
+            return_value=None,
+        ),
+    ):
+        MockModel.return_value.use_aux_hidden_state = True
+        MockModel.return_value.num_aux_hidden_states = 5
+
+        model = Eagle3LlamaForCausalLM(vllm_config=mock_vllm_config)
+
+    assert model.mask_hidden.shape == (1, 5 * mock_hf_config.target_hidden_size)
+
+
 def test_load_weights_kv_scale_handling():
     kv_scale_param = Mock()
     kv_scale_param.weight_loader = Mock()

@@ -4982,6 +4982,49 @@ class GPUModelRunner(
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
+
+                # Propagate eagle_aux_hidden_state_layer_ids from draft config
+                # to target config BEFORE model construction so buffers/layers
+                # use the correct aux count.
+                propagated_aux_layers = None
+                if (
+                    self.use_aux_hidden_state_outputs
+                    and self.speculative_config is not None
+                    and getattr(self.speculative_config, "draft_model_config", None)
+                    is not None
+                ):
+                    draft_hf = self.speculative_config.draft_model_config.hf_config
+                    # Try to get aux layer IDs from multiple locations
+                    aux_layers = getattr(
+                        draft_hf, "eagle_aux_hidden_state_layer_ids", None
+                    )
+                    if aux_layers is None:
+                        draft_eagle_cfg = getattr(draft_hf, "eagle_config", None) or {}
+                        aux_layers = draft_eagle_cfg.get(
+                            "eagle_aux_hidden_state_layer_ids"
+                        )
+
+                    if aux_layers is not None:
+                        propagated_aux_layers = tuple(aux_layers)
+                        target_hf = self.model_config.hf_config
+                        # Set aux layers in eagle_config dict (where models look for it)
+                        eagle_cfg = getattr(target_hf, "eagle_config", None) or {}
+                        eagle_cfg["eagle_aux_hidden_state_layer_ids"] = (
+                            propagated_aux_layers
+                        )
+                        target_hf.eagle_config = eagle_cfg
+                        # Also set as direct attribute for models that look there
+                        target_hf.eagle_aux_hidden_state_layer_ids = (
+                            propagated_aux_layers
+                        )
+                        # Also copy target_hidden_size if present
+                        if hasattr(draft_hf, "target_hidden_size"):
+                            target_hf.target_hidden_size = draft_hf.target_hidden_size
+                        logger.info(
+                            "Propagated aux layers %s to target model config",
+                            propagated_aux_layers,
+                        )
+
                 model_loader = get_model_loader(self.load_config)
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
@@ -4990,10 +5033,59 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+
+                # Set aux hidden states on target model immediately after loading
+                # to install capture hooks with the correct layers
+                if self.use_aux_hidden_state_outputs and propagated_aux_layers:
+                    if hasattr(self.model, "set_aux_hidden_state_layers"):
+                        logger.info(
+                            "Setting aux layers %s on target model for capture",
+                            propagated_aux_layers,
+                        )
+                        self.model.set_aux_hidden_state_layers(propagated_aux_layers)
+                    else:
+                        logger.warning(
+                            "Target model does not support set_aux_hidden_state_layers; "
+                            "aux hidden state capture may use incorrect layers"
+                        )
+
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
+
                     if hasattr(self.drafter, "load_model"):
                         self.drafter.load_model(self.model)
+                    
+                    # After drafter loads, sync the target model's aux layer count
+                    # with what the drafter expects
+                    if self.use_aux_hidden_state_outputs:
+                        try:
+                            parent_ref = self.model
+                            if hasattr(self.model, "get_language_model"):
+                                parent_ref = self.model.get_language_model()
+                            elif hasattr(self.model, "language_model"):
+                                parent_ref = self.model.language_model
+                            # Get current drafter aux count
+                            drafter_parent = self.drafter.model
+                            if hasattr(self.drafter.model, "get_language_model"):
+                                drafter_parent = self.drafter.model.get_language_model()
+                            elif hasattr(self.drafter.model, "language_model"):
+                                drafter_parent = self.drafter.model.language_model
+                            # Sync num_aux_hidden_states
+                            if hasattr(drafter_parent, "num_aux_hidden_states"):
+                                drafter_aux_count = drafter_parent.num_aux_hidden_states
+                                if hasattr(parent_ref, "num_aux_hidden_states"):
+                                    parent_ref.num_aux_hidden_states = drafter_aux_count
+                                if hasattr(parent_ref, "model") and hasattr(
+                                    parent_ref.model, "num_aux_hidden_states"
+                                ):
+                                    parent_ref.model.num_aux_hidden_states = (
+                                        drafter_aux_count
+                                    )
+                        except Exception:
+                            logger.debug(
+                                "Failed to sync num_aux_hidden_states after drafter load",
+                                exc_info=True,
+                            )
                     if (
                         hasattr(self.drafter, "model")
                         and is_mixture_of_experts(self.drafter.model)
@@ -5026,20 +5118,29 @@ class GPUModelRunner(
                             "aux_hidden_state_outputs was requested"
                         )
 
-                    # Try to get auxiliary layers from speculative config,
-                    # otherwise use model's default layers
-                    aux_layers = self._get_eagle3_aux_layers_from_config()
-                    if aux_layers:
-                        logger.info(
-                            "Using auxiliary layers from speculative config: %s",
-                            aux_layers,
-                        )
-                    else:
-                        aux_layers = (
-                            self.model.get_eagle3_default_aux_hidden_state_layers()
-                        )
+                    # If aux layers were already set during load_model (via propagated config),
+                    # we don't need to set them again. This is the normal path for drafter models.
+                    # Only call again if we haven't set them yet (e.g., if propagation failed).
+                    if not propagated_aux_layers:
+                        # Fallback: try to get auxiliary layers from speculative config,
+                        # otherwise use model's default layers
+                        aux_layers = self._get_eagle3_aux_layers_from_config()
+                        if aux_layers:
+                            logger.info(
+                                "Using auxiliary layers from speculative config (fallback): %s",
+                                aux_layers,
+                            )
+                        else:
+                            aux_layers = (
+                                self.model.get_eagle3_default_aux_hidden_state_layers()
+                            )
+                            logger.info(
+                                "Using default auxiliary layers: %s", aux_layers
+                            )
 
-                    self.model.set_aux_hidden_state_layers(aux_layers)
+                        # Set aux layers on target model if it supports the interface
+                        if hasattr(self.model, "set_aux_hidden_state_layers"):
+                            self.model.set_aux_hidden_state_layers(aux_layers)
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
