@@ -34,10 +34,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     if get_pp_group().world_size != 1:
         raise NotImplementedError("DSpark does not support pipeline parallelism.")
 
-    # Self-contained dense DSpark drafts (e.g. Qwen3) ship their own embed_tokens
-    # and lm_head, so aliasing the target's would clobber the loaded weights.
-    # Only the DeepSeek-V4 draft (weights in the target's checkpoint) shares.
-    if not getattr(draft_model, "dspark_shares_target_embeddings", True):
+    # Alias the target's embed_tokens / lm_head for any the draft does not ship.
+    # DeepSeek-V4 drafts share both; dense Qwen3 drafts share only what is absent.
+    shares_all = getattr(draft_model, "dspark_shares_target_embeddings", True)
+    includes_lm_head = getattr(draft_model, "_draft_includes_lm_head", True)
+    includes_embed_tokens = getattr(draft_model, "_draft_includes_embed_tokens", True)
+    share_embed = shares_all or not includes_embed_tokens
+    share_lm_head = shares_all or not includes_lm_head
+    if not share_embed and not share_lm_head:
         return draft_model
 
     target_language_model = (
@@ -49,17 +53,19 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_inner = draft_model.model
 
     # Share the vocab embedding (target.model.embed_tokens -> draft.model).
-    target_embed = getattr(target_inner, "embed_tokens", None)
-    if target_embed is not None:
-        if getattr(draft_inner, "embed_tokens", None) is not None:
-            del draft_inner.embed_tokens
-        draft_inner.embed_tokens = target_embed
+    if share_embed:
+        target_embed = getattr(target_inner, "embed_tokens", None)
+        if target_embed is not None:
+            if getattr(draft_inner, "embed_tokens", None) is not None:
+                del draft_inner.embed_tokens
+            draft_inner.embed_tokens = target_embed
 
     # Share the LM head (target.lm_head -> draft.lm_head).
-    target_lm_head = getattr(target_model, "lm_head", None)
-    if target_lm_head is not None:
-        if getattr(draft_model, "lm_head", None) is not None:
-            del draft_model.lm_head
-        draft_model.lm_head = target_lm_head
+    if share_lm_head:
+        target_lm_head = getattr(target_model, "lm_head", None)
+        if target_lm_head is not None:
+            if getattr(draft_model, "lm_head", None) is not None:
+                del draft_model.lm_head
+            draft_model.lm_head = target_lm_head
 
     return draft_model

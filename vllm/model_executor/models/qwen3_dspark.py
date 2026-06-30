@@ -171,11 +171,26 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
+        includes_lm_head = False
+        includes_embed_tokens = False
         for name, loaded_weight in weights:
-            if "lm_head" not in name:
+            if "lm_head" in name:
+                includes_lm_head = True
+            else:
+                if "embed_tokens" in name:
+                    includes_embed_tokens = True
                 name = "model." + name
             model_weights[name] = loaded_weight
+        # embed_tokens / lm_head absent from the checkpoint are aliased from the
+        # target by load_dspark_model; skip them so they are not flagged missing.
+        self._draft_includes_lm_head = includes_lm_head
+        self._draft_includes_embed_tokens = includes_embed_tokens
         # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
-        loader = AutoWeightsLoader(self, skip_substrs=["mask_embedding"])
+        skip_substrs = ["mask_embedding"]
+        if not includes_lm_head:
+            skip_substrs.append("lm_head")
+        if not includes_embed_tokens:
+            skip_substrs.append("embed_tokens")
+        loader = AutoWeightsLoader(self, skip_substrs=skip_substrs)
         loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
